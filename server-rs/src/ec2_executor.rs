@@ -204,16 +204,22 @@ impl EC2JobExecutor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(SSM_READY_TIMEOUT);
 
         while tokio::time::Instant::now() < deadline {
+            let filter = match ssm::types::InstanceInformationStringFilter::builder()
+                .key("InstanceIds")
+                .values(&self.worker_instance_id)
+                .build()
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Failed to build SSM filter: {}", e);
+                    return false;
+                }
+            };
+
             let resp = self
                 .ssm()
                 .describe_instance_information()
-                .filters(
-                    ssm::types::InstanceInformationStringFilter::builder()
-                        .key("InstanceIds")
-                        .values(&self.worker_instance_id)
-                        .build()
-                        .unwrap(),
-                )
+                .filters(filter)
                 .send()
                 .await;
 
@@ -232,10 +238,61 @@ impl EC2JobExecutor {
         false
     }
 
+    /// Shell-escape a value for safe single-quote embedding.
+    /// Replaces single quotes with: '\'' (end quote, literal quote, start quote).
+    fn shell_escape(s: &str) -> String {
+        s.replace('\'', "'\\''")
+    }
+
+    /// Validate that a job field value is safe for use in a shell script.
+    /// Rejects values containing dangerous shell metacharacters.
+    fn validate_shell_field(value: &str, field_name: &str) -> Result<(), String> {
+        // Allow alphanumeric, hyphens, underscores, dots, slashes, spaces, @, colons
+        // Reject backticks, $, ;, |, &, newlines, etc.
+        let dangerous_chars = ['`', '$', ';', '|', '&', '\n', '\r', '(', ')', '{', '}', '<', '>'];
+        for c in dangerous_chars {
+            if value.contains(c) {
+                return Err(format!(
+                    "Field '{}' contains unsafe character '{}' — rejecting to prevent injection",
+                    field_name, c
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Build the shell script that runs on the worker instance.
-    fn build_worker_script(&self, job: &Job) -> String {
+    ///
+    /// Security measures:
+    /// - All job data is validated against shell metacharacters before interpolation
+    /// - The GitHub token is delivered via a restricted env file (chmod 600, owned by ec2-user)
+    ///   and is deleted immediately after use
+    /// - The env file is never written to logs or output
+    fn build_worker_script(&self, job: &Job) -> Result<String, String> {
         let retry_of = job.retry_of.as_deref().unwrap_or("");
-        format!(
+
+        // Validate all job fields that will be interpolated into the shell script
+        Self::validate_shell_field(&job.id, "job_id")?;
+        Self::validate_shell_field(&job.repo_url, "repo_url")?;
+        Self::validate_shell_field(&job.branch, "branch")?;
+        Self::validate_shell_field(&job.commit_sha, "commit_sha")?;
+        Self::validate_shell_field(&job.spec_name, "spec_name")?;
+        Self::validate_shell_field(retry_of, "retry_of")?;
+        Self::validate_shell_field(&self.btb_path, "btb_path")?;
+
+        // Shell-escape all values for safe embedding in single-quoted contexts
+        let job_id = Self::shell_escape(&job.id);
+        let repo_url = Self::shell_escape(&job.repo_url);
+        let branch = Self::shell_escape(&job.branch);
+        let commit_sha = Self::shell_escape(&job.commit_sha);
+        let spec_name = Self::shell_escape(&job.spec_name);
+        let btb_path = Self::shell_escape(&self.btb_path);
+        let retry_of = Self::shell_escape(retry_of);
+        // Token is NOT validated via validate_shell_field since it may contain special chars,
+        // but it's delivered through a restricted file, not direct interpolation.
+        let github_token = Self::shell_escape(&self.github_token);
+
+        Ok(format!(
             r#"#!/bin/bash
 set +e
 JOB_ID='{job_id}'
@@ -246,14 +303,24 @@ rm -rf "${{JOB_DIR}}" 2>/dev/null || true
 mkdir -p "${{JOB_DIR}}" "${{LOGS_DIR}}"
 chown -R ec2-user:ec2-user "${{JOB_DIR}}" "${{LOGS_DIR}}"
 
+# Write credentials to a restricted file owned by ec2-user only.
+# This file is deleted immediately after the worker script sources it.
+CRED_FILE="/run/btb-cred-${{JOB_ID}}"
+install -m 0600 -o ec2-user -g ec2-user /dev/null "${{CRED_FILE}}"
+cat > "${{CRED_FILE}}" << 'CREDEOF'
+{github_token}
+CREDEOF
+chmod 600 "${{CRED_FILE}}"
+chown ec2-user:ec2-user "${{CRED_FILE}}"
+
 ENV_FILE="/tmp/btb-env-${{JOB_ID}}.sh"
+install -m 0600 -o ec2-user -g ec2-user /dev/null "${{ENV_FILE}}"
 cat > "${{ENV_FILE}}" << ENVEOF
 export BTB_JOB_ID='{job_id}'
 export BTB_REPO_URL='{repo_url}'
 export BTB_BRANCH='{branch}'
 export BTB_COMMIT_SHA='{commit_sha}'
 export BTB_SPEC_NAME='{spec_name}'
-export BTB_GITHUB_TOKEN='{github_token}'
 export BTB_PATH='{btb_path}'
 export BTB_RETRY_OF='{retry_of}'
 export BTB_TIMEOUT='{timeout}'
@@ -274,12 +341,32 @@ LOGS_DIR="/var/btb/logs"
 JOB_DIR="${{JOBS_DIR}}/${{BTB_JOB_ID}}"
 REPO_DIR="${{JOB_DIR}}/repo"
 OUTPUT_LOG="${{JOB_DIR}}/output.log"
+CRED_FILE="/run/btb-cred-${{BTB_JOB_ID}}"
+
 exec > >(tee -a "${{OUTPUT_LOG}}") 2>&1
 echo "[$(date -Iseconds)] Starting btb job ${{BTB_JOB_ID}}"
-AUTH_URL=$(echo "${{BTB_REPO_URL}}" | sed "s|https://github.com/|https://x-access-token:${{BTB_GITHUB_TOKEN}}@github.com/|")
-git clone --branch "${{BTB_BRANCH}}" "${{AUTH_URL}}" "${{REPO_DIR}}"
+
+# Read the token from the restricted credential file and delete it immediately
+BTB_GITHUB_TOKEN="$(cat "${{CRED_FILE}}" 2>/dev/null)"
+rm -f "${{CRED_FILE}}"
+
+# Use GIT_ASKPASS for secure credential delivery (token never in URL or process listing)
+ASKPASS_SCRIPT="${{JOB_DIR}}/.git-askpass.sh"
+printf '#!/bin/sh\necho "%s"\n' "${{BTB_GITHUB_TOKEN}}" > "${{ASKPASS_SCRIPT}}"
+chmod 700 "${{ASKPASS_SCRIPT}}"
+export GIT_ASKPASS="${{ASKPASS_SCRIPT}}"
+export GIT_TERMINAL_PROMPT=0
+
+# Clone using x-access-token username (password provided via GIT_ASKPASS)
+CLONE_URL=$(echo "${{BTB_REPO_URL}}" | sed "s|https://github.com/|https://x-access-token@github.com/|")
+git clone --branch "${{BTB_BRANCH}}" "${{CLONE_URL}}" "${{REPO_DIR}}"
 cd "${{REPO_DIR}}"
 git checkout "${{BTB_COMMIT_SHA}}"
+
+# Clean up askpass and token from memory
+rm -f "${{ASKPASS_SCRIPT}}"
+unset BTB_GITHUB_TOKEN
+
 if [ -n "${{BTB_RETRY_OF}}" ]; then
     RESULTS_BRANCH="btb-results/${{BTB_BRANCH}}"
     if git ls-remote --heads origin "${{RESULTS_BRANCH}}" | grep -q .; then
@@ -319,25 +406,31 @@ BTBEOF
 chmod +x "${{WORKER_SCRIPT}}"
 su - ec2-user -c "source ${{ENV_FILE}} && bash ${{WORKER_SCRIPT}}"
 WORKER_EXIT=$?
-rm -f "${{ENV_FILE}}" "${{WORKER_SCRIPT}}"
+rm -f "${{ENV_FILE}}" "${{WORKER_SCRIPT}}" "${{CRED_FILE}}" 2>/dev/null
 nohup bash -c 'sleep 5 && sudo shutdown now' &>/dev/null &
 exit $WORKER_EXIT
 "#,
-            job_id = job.id,
-            repo_url = job.repo_url,
-            branch = job.branch,
-            commit_sha = job.commit_sha,
-            spec_name = job.spec_name,
-            github_token = self.github_token,
-            btb_path = self.btb_path,
+            job_id = job_id,
+            repo_url = repo_url,
+            branch = branch,
+            commit_sha = commit_sha,
+            spec_name = spec_name,
+            github_token = github_token,
+            btb_path = btb_path,
             retry_of = retry_of,
             timeout = self.job_timeout,
-        )
+        ))
     }
 
     /// Send the btb job command to the worker via SSM Run Command.
     async fn send_job_command(&self, job: &Job) -> Option<String> {
-        let script = self.build_worker_script(job);
+        let script = match self.build_worker_script(job) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to build worker script for job {}: {}", job.id, e);
+                return None;
+            }
+        };
 
         let resp = self
             .ssm()

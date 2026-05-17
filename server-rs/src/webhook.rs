@@ -100,8 +100,13 @@ async fn check_btb_file(
         .await
         .map_err(|e| format!("GitHub API request failed: {}", e))?;
 
-    if resp.status() != 200 {
-        return Err(format!("GitHub API returned {}", resp.status()));
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Do NOT log the response body — it may echo back auth headers or tokens
+        return Err(format!(
+            "GitHub API returned HTTP {} when listing repo contents",
+            status
+        ));
     }
 
     let contents: Vec<serde_json::Value> = resp
@@ -144,7 +149,7 @@ async fn check_btb_file(
         .header("User-Agent", "btb-server")
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch .btb file: {}", e))?;
+        .map_err(|e| format!("GitHub API request failed when fetching .btb file: {}", e))?;
 
     if file_resp.status() != 200 {
         return Ok(BtbFileResult {
@@ -377,7 +382,11 @@ pub async fn handle_webhook(
     {
         Ok(r) => r,
         Err(e) => {
-            error!("GitHub API error checking .btb file: {}", e);
+            // Log only the sanitized error — never log the token or full URLs with credentials
+            error!(
+                "GitHub API error checking .btb file for {}/{}: {}",
+                owner, repo_name, e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GitHub API error".to_string(),

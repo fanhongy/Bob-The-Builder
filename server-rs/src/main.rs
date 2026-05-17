@@ -275,11 +275,16 @@ async fn main() {
         .unwrap_or(Path::new("/var/btb"))
         .join(".queue-lock");
 
+    let lock_file_str = lock_file
+        .to_str()
+        .unwrap_or("/var/btb/.queue-lock")
+        .to_string();
+
     let queue = JobQueue::new(
         &config.queue_dir,
         &config.completed_dir,
         &config.jobs_dir,
-        Some(lock_file.to_str().unwrap()),
+        Some(&lock_file_str),
     )
     .expect("Failed to create job queue");
 
@@ -300,7 +305,7 @@ async fn main() {
                 &config.queue_dir,
                 &config.completed_dir,
                 &config.jobs_dir,
-                Some(lock_file.to_str().unwrap()),
+                Some(&lock_file_str),
             )
             .expect("Failed to create executor queue"),
         )),
@@ -317,7 +322,7 @@ async fn main() {
                 &config.queue_dir,
                 &config.completed_dir,
                 &config.jobs_dir,
-                Some(lock_file.to_str().unwrap()),
+                Some(&lock_file_str),
             )
             .expect("Failed to create app state queue"),
         ),

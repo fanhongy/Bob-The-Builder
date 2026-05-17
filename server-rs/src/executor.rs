@@ -130,42 +130,83 @@ impl JobExecutor {
         }
     }
 
-    /// Get the authenticated URL for cloning.
-    fn get_authenticated_url(&self, repo_url: &str) -> String {
-        match &self.github_token {
-            Some(token) if repo_url.starts_with("https://github.com/") => repo_url.replacen(
-                "https://github.com/",
-                &format!("https://x-access-token:{}@github.com/", token),
-                1,
-            ),
-            _ => repo_url.to_string(),
+    /// Create a GIT_ASKPASS helper script that provides the token without
+    /// embedding it in the URL or exposing it in process listings.
+    fn create_askpass_script(&self, job_dir: &Path) -> Option<PathBuf> {
+        let token = self.github_token.as_deref()?;
+        let script_path = job_dir.join(".git-askpass.sh");
+        let script_content = format!("#!/bin/sh\necho \"{}\"", token);
+        std::fs::write(&script_path, &script_content).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
         }
+        Some(script_path)
+    }
+
+    /// Remove the GIT_ASKPASS helper script after use.
+    fn cleanup_askpass_script(&self, job_dir: &Path) {
+        let script_path = job_dir.join(".git-askpass.sh");
+        let _ = std::fs::remove_file(&script_path);
     }
 
     /// Clone the repository and checkout the target commit.
+    ///
+    /// Uses GIT_ASKPASS to provide credentials securely without embedding
+    /// tokens in URLs (which would expose them in process listings and logs).
     async fn clone_repo(&self, job: &Job) -> i32 {
         let repo_dir = self.repo_dir(job);
         let job_dir = self.job_dir(job);
         let _ = std::fs::create_dir_all(&job_dir);
 
-        let clone_url = self.get_authenticated_url(&job.repo_url);
         let repo_dir_str = repo_dir.to_string_lossy().to_string();
         let job_dir_str = job_dir.to_string_lossy().to_string();
 
-        let (rc, _, err) = self
-            .run_subprocess(
-                &[
-                    "git",
-                    "clone",
-                    "--branch",
-                    &job.branch,
-                    &clone_url,
-                    &repo_dir_str,
-                ],
-                &job_dir_str,
-                Some(300),
+        // Use the original URL (no token embedded) — authenticate via GIT_ASKPASS
+        let clone_url = if job.repo_url.starts_with("https://github.com/") {
+            // Rewrite to use x-access-token username so git prompts for password
+            job.repo_url.replacen(
+                "https://github.com/",
+                "https://x-access-token@github.com/",
+                1,
             )
-            .await;
+        } else {
+            job.repo_url.clone()
+        };
+
+        // Build the clone command with GIT_ASKPASS for secure credential injection
+        let askpass_script = self.create_askpass_script(&job_dir);
+
+        let output_future = {
+            let mut cmd = Command::new("git");
+            cmd.args(["clone", "--branch", &job.branch, &clone_url, &repo_dir_str])
+                .current_dir(&job_dir_str)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            // Set GIT_ASKPASS environment variable for secure token delivery
+            if let Some(ref script) = askpass_script {
+                cmd.env("GIT_ASKPASS", script);
+                cmd.env("GIT_TERMINAL_PROMPT", "0");
+            }
+            cmd.output()
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            output_future,
+        )
+        .await;
+
+        // Clean up the askpass script immediately after clone
+        self.cleanup_askpass_script(&job_dir);
+
+        let (rc, err) = match result {
+            Ok(Ok(out)) => (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Ok(Err(e)) => (-1, format!("Failed to execute: {}", e)),
+            Err(_) => (-1, "Command timed out".to_string()),
+        };
 
         if rc != 0 {
             error!("git clone failed for job {}: {}", job.id, err);
@@ -282,6 +323,8 @@ impl JobExecutor {
     }
 
     /// Run btb inside `script` for terminal capture.
+    ///
+    /// Uses explicit argument passing to avoid shell injection via spec_name.
     async fn run_btb(&self, job: &Job) -> i32 {
         let repo_dir = self.repo_dir(job);
         let typescript_path = self.typescript_path(job);
@@ -289,10 +332,23 @@ impl JobExecutor {
         let repo_dir_str = repo_dir.to_string_lossy().to_string();
         let typescript_str = typescript_path.to_string_lossy().to_string();
 
-        // Linux: script -q -c "btb.sh <spec>" typescript.log
+        // Validate spec_name to prevent shell injection:
+        // Only allow alphanumeric, hyphens, underscores, dots, and slashes
+        if !job.spec_name.chars().all(|c| c.is_alphanumeric() || "-_./ ".contains(c)) {
+            error!(
+                "Invalid spec_name for job {}: contains unsafe characters",
+                job.id
+            );
+            return -1;
+        }
+
+        // Use explicit argv-style execution to avoid shell metacharacter interpretation.
+        // script -q -c takes a single command string, so we shell-quote the arguments.
+        let quoted_btb = shell_escape(&btb_script);
+        let quoted_spec = shell_escape(&job.spec_name);
         let shell_cmd = format!(
-            "script -q -c \"{} {}\" {}",
-            btb_script, job.spec_name, typescript_str
+            "script -q -c '{} {}' {}",
+            quoted_btb, quoted_spec, shell_escape(&typescript_str)
         );
 
         let mut child = match Command::new("bash")
@@ -331,8 +387,13 @@ impl JobExecutor {
                 );
                 // Send SIGTERM to process group
                 if let Some(pid) = pid {
-                    unsafe {
-                        libc::killpg(pid as i32, libc::SIGTERM);
+                    let result = unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
+                    if result != 0 {
+                        warn!(
+                            "Failed to send SIGTERM to process group {} (errno: {})",
+                            pid,
+                            std::io::Error::last_os_error()
+                        );
                     }
                 }
 
@@ -350,8 +411,13 @@ impl JobExecutor {
                             job.id
                         );
                         if let Some(pid) = pid {
-                            unsafe {
-                                libc::killpg(pid as i32, libc::SIGKILL);
+                            let result = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+                            if result != 0 {
+                                warn!(
+                                    "Failed to send SIGKILL to process group {} (errno: {})",
+                                    pid,
+                                    std::io::Error::last_os_error()
+                                );
                             }
                         }
                         let _ = child.wait().await;
@@ -576,4 +642,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Shell-escape a string for safe embedding in single-quoted shell contexts.
+/// Replaces single quotes with the sequence: '\'' (end quote, escaped quote, start quote).
+fn shell_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
 }
