@@ -271,6 +271,12 @@ func (o *Orchestrator) spawnWorker(ctx context.Context, taskID string, resultCh 
 		return fmt.Errorf("task %s not found in DAG", taskID)
 	}
 
+	// Update current wave in TUI
+	waveID := o.DAG.GetTaskWave(taskID)
+	if waveID >= 0 {
+		o.tuiSetCurrentWave(waveID)
+	}
+
 	// Get task description
 	taskDesc, _ := taskfile.GetTaskDescription(o.Config.TaskFile, taskID)
 	if taskDesc == "" {
@@ -416,5 +422,11 @@ func (o *Orchestrator) tuiSetPhase(phase string) {
 func (o *Orchestrator) tuiSetProgress(completed, total int, elapsed time.Duration) {
 	if o.TUI != nil {
 		o.TUI.SetProgress(completed, total, elapsed)
+	}
+}
+
+func (o *Orchestrator) tuiSetCurrentWave(wave int) {
+	if o.TUI != nil {
+		o.TUI.SetCurrentWave(wave)
 	}
 }

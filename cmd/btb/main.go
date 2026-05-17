@@ -13,6 +13,7 @@ import (
 	"github.com/fanhongy/Bob-The-Builder/internal/git"
 	"github.com/fanhongy/Bob-The-Builder/internal/logging"
 	"github.com/fanhongy/Bob-The-Builder/internal/orchestrator"
+	"github.com/fanhongy/Bob-The-Builder/internal/tui"
 	"github.com/fanhongy/Bob-The-Builder/internal/worker"
 )
 
@@ -140,12 +141,23 @@ func main() {
 
 	// Initialize state manager and orchestrator
 	state := worker.NewStateManager()
+
+	var tuiInstance *tui.TUI
+	if !cfg.NoTUI {
+		tuiInstance = tui.NewTUI(taskDAG, cfg)
+	}
+
+	var tuiIface orchestrator.TUIInterface
+	if tuiInstance != nil {
+		tuiIface = tuiInstance
+	}
+
 	orch := &orchestrator.Orchestrator{
 		Config: cfg,
 		DAG:    taskDAG,
 		State:  state,
 		Logger: logger,
-		TUI:    nil, // TUI integration will come in FEAT-004
+		TUI:    tuiIface,
 	}
 
 	// Set up context with signal handling
@@ -160,13 +172,29 @@ func main() {
 		cancel()
 	}()
 
+	// Start TUI if enabled
+	if tuiInstance != nil {
+		if err := tuiInstance.Start(); err != nil {
+			logger.Warn("failed to start TUI: %v", err)
+		} else {
+			defer tuiInstance.Stop()
+		}
+	}
+
 	// Run the orchestrator
 	if err := orch.Run(ctx); err != nil {
+		if tuiInstance != nil {
+			tuiInstance.Stop()
+		}
 		if err == context.Canceled {
 			logger.Info("execution cancelled")
 		} else {
 			logger.Error("orchestrator error: %v", err)
 			os.Exit(1)
+		}
+	} else {
+		if tuiInstance != nil {
+			tuiInstance.Stop()
 		}
 	}
 }
