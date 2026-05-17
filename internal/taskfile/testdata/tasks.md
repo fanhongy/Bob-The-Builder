@@ -1,0 +1,10 @@
+- [ ] 1. Set up project infrastructure
+  - [x] 1.1 Initialize project with TypeScript config
+  - [ ] 1.2 Set up database schema
+- [ ] 2. Implement core features
+  - [ ] 2.1 Build the API layer
+  - [x] 2.2 Add authentication
+  - [ ] 2.3 Add authorization
+- [x] 3. Checkpoint - basic setup complete
+- [ ] 4. Testing
+  - [ ] 4.1 Unit tests

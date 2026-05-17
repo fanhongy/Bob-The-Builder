@@ -1,3 +1,6 @@
+# Go binary
+/btb
+
 # btb runtime artifacts
 .ralph-logs/
 .ralph-worktrees/
