@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // SetupSharedBuildCache configures shared build cache environment variables
@@ -75,16 +76,17 @@ func getMainRepoRoot() string {
 	if err != nil {
 		return ""
 	}
-	// First line is the main worktree
-	lines := filepath.SplitList(string(out))
+	// First line is the main worktree; output is newline-delimited.
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) == 0 {
 		return ""
 	}
-	// Parse first word of first line
-	for i, c := range string(out) {
-		if c == ' ' || c == '\t' || c == '\n' {
-			return string(out[:i])
+	// Parse first word of first line (the worktree path)
+	firstLine := lines[0]
+	for i, c := range firstLine {
+		if c == ' ' || c == '\t' {
+			return firstLine[:i]
 		}
 	}
-	return ""
+	return firstLine
 }

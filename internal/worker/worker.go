@@ -166,10 +166,11 @@ func (w *Worker) runKiroCLI(ctx context.Context, prompt string, logFile *os.File
 		return false, fmt.Errorf("failed to start kiro-cli: %w", err)
 	}
 
-	// Start heartbeat goroutine that monitors the process
-	heartbeatDone := make(chan struct{})
+	// Start heartbeat goroutine that monitors the process.
+	// Use a separate stopCh (closed by the caller) to signal the goroutine to exit.
+	// The goroutine must not close stopCh itself to avoid send-on-closed-channel panics.
+	stopHeartbeat := make(chan struct{})
 	go func() {
-		defer close(heartbeatDone)
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -180,7 +181,7 @@ func (w *Worker) runKiroCLI(ctx context.Context, prompt string, logFile *os.File
 				os.WriteFile(hbFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
 			case <-ctx.Done():
 				return
-			case <-heartbeatDone:
+			case <-stopHeartbeat:
 				return
 			}
 		}
@@ -205,10 +206,7 @@ func (w *Worker) runKiroCLI(ctx context.Context, prompt string, logFile *os.File
 	err = cmd.Wait()
 
 	// Signal heartbeat goroutine to stop
-	select {
-	case heartbeatDone <- struct{}{}:
-	default:
-	}
+	close(stopHeartbeat)
 
 	if err != nil && ctx.Err() == nil {
 		return completed, fmt.Errorf("kiro-cli exited with error: %w", err)

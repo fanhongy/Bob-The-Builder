@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -73,8 +74,9 @@ func isProcessAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	// On Unix, FindProcess always succeeds. Signal 0 checks existence.
-	err = proc.Signal(os.Signal(nil))
+	// On Unix, FindProcess always succeeds. Signal 0 checks existence
+	// without actually sending a signal.
+	err = proc.Signal(syscall.Signal(0))
 	// If err is nil, process is alive. If it's a permission error, also alive.
 	if err == nil {
 		return true

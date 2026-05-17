@@ -1,3 +1,3 @@
 module github.com/fanhongy/Bob-The-Builder
 
-go 1.25
+go 1.24

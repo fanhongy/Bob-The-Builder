@@ -98,8 +98,15 @@ Output 'CONFLICTS_RESOLVED' when done.`, taskID, branchName, fileList, taskID)
 }
 
 // AutoResolveConflicts resolves merge conflicts using fallback strategies:
-// - tasks.md: union of completion marks
-// - source files: try git merge-file, fall back to checkout --theirs
+// - tasks.md: checkout --theirs (the branch version has the latest completion marks)
+// - source files: checkout --theirs
+//
+// Trade-off: this unconditionally takes the incoming branch's version for all
+// conflicted files, which means edits on the main branch (e.g., from tasks merged
+// earlier in the same wave) may be silently discarded. This matches the original
+// bash implementation's behavior. The rationale is that the AI-driven resolver agent
+// (called first) should handle the nuanced cases; this fallback is a last resort to
+// keep the pipeline moving rather than blocking indefinitely on unresolvable conflicts.
 func AutoResolveConflicts(taskID string) error {
 	out, err := exec.Command("git", "diff", "--name-only", "--diff-filter=U").Output()
 	if err != nil {

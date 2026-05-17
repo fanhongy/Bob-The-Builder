@@ -351,7 +351,10 @@ func (o *Orchestrator) checkStaleWorkers() {
 					proc.Signal(os.Kill)
 				}
 			}
-			o.Logger.Warn("task %s stale (idle %v), killed", id, idleTime)
+			// Transition task to failed so the scheduler does not get stuck
+			o.State.SetStatus(id, worker.StatusFailed)
+			o.tuiSetTaskState(id, "failed")
+			o.Logger.Warn("task %s stale (idle %v), killed and marked failed", id, idleTime)
 			o.tuiAddEvent(fmt.Sprintf("task %s stale (idle %v), killed", id, idleTime))
 		}
 	}
@@ -381,7 +384,10 @@ func (o *Orchestrator) checkJobTimeouts() {
 					proc.Signal(os.Kill)
 				}
 			}
-			o.Logger.Warn("task %s hit job timeout (%v > %v), killed", id, elapsed, timeout)
+			// Transition task to failed so the scheduler does not get stuck
+			o.State.SetStatus(id, worker.StatusFailed)
+			o.tuiSetTaskState(id, "failed")
+			o.Logger.Warn("task %s hit job timeout (%v > %v), killed and marked failed", id, elapsed, timeout)
 			o.tuiAddEvent(fmt.Sprintf("task %s hit job timeout, killed", id))
 		}
 	}

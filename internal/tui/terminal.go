@@ -26,6 +26,10 @@ type termios struct {
 	Ospeed uint32
 }
 
+// Linux-only ioctl constants. These values are specific to the Linux kernel
+// (amd64/arm64). On macOS/Darwin the ioctl numbers differ (e.g., TIOCGWINSZ
+// is 0x40087468). This is acceptable since the target deployment environment
+// is Linux; cross-platform support would require build tags or x/sys/unix.
 const (
 	ioctlTIOCGWINSZ = 0x5413
 	ioctlTCGETS     = 0x5401
@@ -73,8 +77,8 @@ func EnableRawMode() (restore func(), err error) {
 	raw.Lflag &^= tECHO | tICANON | tISIG
 	// Disable input processing
 	raw.Iflag &^= tIXON | tICRNL
-	// Min bytes = 0, timeout = 0 (non-blocking)
-	raw.Cc[6] = 0  // VMIN
+	// Min bytes = 1 (block until at least one byte available), timeout = 0
+	raw.Cc[6] = 1  // VMIN: wait for at least 1 byte to avoid hot-spin
 	raw.Cc[5] = 0  // VTIME
 
 	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(ioctlTCSETS), uintptr(unsafe.Pointer(&raw)))
